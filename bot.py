@@ -1,4 +1,5 @@
 import os
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -12,6 +13,12 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 # Existing Rich Waters IDs
 ANNOUNCEMENTS_CHANNEL_ID = 1454759203070808224
 WL_CHAT_CHANNEL_ID = 1377119716434378792
+
+# Existing Rich Waters channel IDs
+WELCOME_CHANNEL_ID = 1565061825056342128
+VERIFY_CHANNEL_ID = 1565061828461985906
+REQUEST_WL_CHANNEL_ID = 1565061831528026243
+OPEN_TICKET_CHANNEL_ID = 1565061880865624125
 
 FOUNDER_ROLE_ID = 1482564578087796826
 CO_FOUNDER_ROLE_ID = 1377119587878834196
@@ -64,7 +71,12 @@ async def get_or_create_category(guild, name, overwrites=None):
         if overwrites is not None:
             await category.edit(overwrites=overwrites)
         return category
-    return await guild.create_category(name, overwrites=overwrites, reason="Rich Waters automated setup")
+
+    kwargs = {"reason": "Rich Waters automated setup"}
+    if overwrites is not None:
+        kwargs["overwrites"] = overwrites
+
+    return await guild.create_category(name, **kwargs)
 
 async def get_or_create_text(category, name, overwrites=None):
     channel = discord.utils.get(category.text_channels, name=name)
@@ -90,8 +102,187 @@ async def get_or_create_forum(category, name, overwrites=None):
             return ch
     return await category.create_forum(name, overwrites=overwrites)
 
+
+def is_staff(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator or has_any_role_id(
+        member, STAFF_ROLE_ID, FOUNDER_ROLE_ID, CO_FOUNDER_ROLE_ID
+    )
+
+def female_verifier_role(guild: discord.Guild):
+    return discord.utils.get(guild.roles, name="💋・𝐅𝐄𝐌𝐀𝐋𝐄 𝐕𝐄𝐑𝐈𝐅𝐈𝐄𝐑")
+
+async def wl_requests_channel(guild: discord.Guild):
+    channel = discord.utils.get(guild.text_channels, name="📥・𝐖𝐋-𝐑𝐄𝐐𝐔𝐄𝐒𝐓𝐒")
+    if channel:
+        return channel
+    staff_cat = discord.utils.get(guild.categories, name="🛡️・𝐒𝐓𝐀𝐅𝐅 𝐇𝐐")
+    staff = guild.get_role(STAFF_ROLE_ID)
+    founder = guild.get_role(FOUNDER_ROLE_ID)
+    cofounder = guild.get_role(CO_FOUNDER_ROLE_ID)
+    ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    for role in (staff, founder, cofounder):
+        if role:
+            ow[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    return await guild.create_text_channel(
+        "📥・𝐖𝐋-𝐑𝐄𝐐𝐔𝐄𝐒𝐓𝐒", category=staff_cat, overwrites=ow,
+        reason="Rich Waters WL requests"
+    )
+
+async def wl_approved_channel(guild: discord.Guild):
+    channel = discord.utils.get(guild.text_channels, name="✅・𝐖𝐋-𝐀𝐏𝐏𝐑𝐎𝐕𝐄𝐃")
+    if channel:
+        return channel
+    request_channel = guild.get_channel(REQUEST_WL_CHANNEL_ID)
+    category = request_channel.category if request_channel else discord.utils.get(
+        guild.categories, name="🔑・𝐆𝐄𝐓 𝐖𝐇𝐈𝐓𝐄𝐋𝐈𝐒𝐓𝐄𝐃"
+    )
+    verified = guild.get_role(VERIFIED_ROLE_ID)
+    wl = guild.get_role(WL_ROLE_ID)
+    staff = guild.get_role(STAFF_ROLE_ID)
+    ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    if verified:
+        ow[verified] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+    if wl:
+        ow[wl] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+    if staff:
+        ow[staff] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    channel = await guild.create_text_channel(
+        "✅・𝐖𝐋-𝐀𝐏𝐏𝐑𝐎𝐕𝐄𝐃", category=category, overwrites=ow,
+        reason="Rich Waters WL approvals"
+    )
+    if request_channel and request_channel.category == channel.category:
+        try:
+            await channel.edit(position=request_channel.position + 1)
+        except discord.HTTPException:
+            pass
+    return channel
+
+async def ticket_log(guild: discord.Guild, message: str):
+    ch = discord.utils.get(guild.text_channels, name="🎫・𝐓𝐈𝐂𝐊𝐄𝐓-𝐋𝐎𝐆𝐒")
+    if ch:
+        await ch.send(message)
+
+class VerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="VERIFY", emoji="🔐", style=discord.ButtonStyle.success, custom_id="rw:verify")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role = interaction.guild.get_role(VERIFIED_ROLE_ID)
+        if not role:
+            return await interaction.response.send_message("❌ Verified role not found.", ephemeral=True)
+        if role in interaction.user.roles:
+            return await interaction.response.send_message("✅ You're already verified. Use **/wl** next.", ephemeral=True)
+        try:
+            await interaction.user.add_roles(role, reason="Rich Waters verification")
+            await interaction.response.send_message("✅ **You're verified!** Now use **/wl** to request whitelist access.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Move the bot role above the Verified role.", ephemeral=True)
+
+async def create_ticket(interaction: discord.Interaction, ticket_type: str):
+    guild = interaction.guild
+    member = interaction.user
+    prefix = {"General Support":"support", "Donations":"donation", "Female Verification":"female"}[ticket_type]
+    marker = f"rw-owner:{member.id};rw-type:{prefix}"
+    existing = next((c for c in guild.text_channels if c.topic and marker in c.topic), None)
+    if existing:
+        return await interaction.response.send_message(f"🎫 You already have an open ticket: {existing.mention}", ephemeral=True)
+
+    panel = guild.get_channel(OPEN_TICKET_CHANNEL_ID)
+    category = panel.category if panel else discord.utils.get(guild.categories, name="🎫・𝐂𝐈𝐓𝐘 𝐒𝐔𝐏𝐏𝐎𝐑𝐓")
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+    }
+    for role in (guild.get_role(STAFF_ROLE_ID), guild.get_role(FOUNDER_ROLE_ID), guild.get_role(CO_FOUNDER_ROLE_ID)):
+        if role:
+            ow[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    fv = female_verifier_role(guild)
+    if ticket_type == "Female Verification" and fv:
+        ow[fv] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    safe = re.sub(r"[^a-z0-9-]", "", member.display_name.lower().replace(" ", "-"))[:35] or str(member.id)
+    channel = await guild.create_text_channel(
+        f"{prefix}-{safe}", category=category, overwrites=ow, topic=marker,
+        reason=f"{ticket_type} ticket opened by {member}"
+    )
+    embed = discord.Embed(
+        title=f"🎫 {ticket_type.upper()}",
+        description=f"{member.mention} your private ticket is open. 💎\n\nTell us what you need help with below."
+    )
+    await channel.send(content=member.mention, embed=embed, view=TicketControls())
+    await ticket_log(guild, f"🎫 **Opened:** {channel.mention} by {member.mention} — **{ticket_type}**")
+    await interaction.response.send_message(f"🎫 Ticket created: {channel.mention}", ephemeral=True)
+
+class TicketSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Choose a ticket type...",
+            min_values=1, max_values=1,
+            custom_id="rw:ticket-select",
+            options=[
+                discord.SelectOption(label="General Support", value="General Support", emoji="🎫"),
+                discord.SelectOption(label="Donations", value="Donations", emoji="💰"),
+                discord.SelectOption(label="Female Verification", value="Female Verification", emoji="💋"),
+            ]
+        )
+    async def callback(self, interaction: discord.Interaction):
+        await create_ticket(interaction, self.values[0])
+
+class TicketPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketSelect())
+
+class TicketControls(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="rw:claim")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fv = female_verifier_role(interaction.guild)
+        allowed = is_staff(interaction.user) or (fv and fv in interaction.user.roles)
+        if not allowed:
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        await interaction.response.send_message(f"🛡️ {interaction.user.mention} claimed this ticket.")
+        await ticket_log(interaction.guild, f"🛡️ **Claimed:** {interaction.channel.mention} by {interaction.user.mention}")
+
+    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="rw:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        topic = interaction.channel.topic or ""
+        match = re.search(r"rw-owner:(\d+)", topic)
+        owner = bool(match and int(match.group(1)) == interaction.user.id)
+        fv = female_verifier_role(interaction.guild)
+        if not (owner or is_staff(interaction.user) or (fv and fv in interaction.user.roles)):
+            return await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
+        await interaction.response.send_message("🔒 Closing ticket...")
+        await ticket_log(interaction.guild, f"🔒 **Closed:** `{interaction.channel.name}` by {interaction.user.mention}")
+        await interaction.channel.delete(reason=f"Closed by {interaction.user}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+    if not channel:
+        return
+    embed = discord.Embed(
+        title="✈️ WELCOME TO RICH WATERS RP",
+        description=(
+            f"Welcome {member.mention} to **RICH WATERS RP** 🩸\n\n"
+            f"✅ Start by completing Discord verification in <#{VERIFY_CHANNEL_ID}>.\n\n"
+            f"🎫 Once verified, request whitelist access in <#{REQUEST_WL_CHANNEL_ID}>.\n\n"
+            f"💋 **Female WL:** Open a ticket in <#{OPEN_TICKET_CHANNEL_ID}> and choose **Female Verification** to get verified.\n\n"
+            "🥂 **WELCOME TO THE RICH LIFE.** 📖🔥"
+        )
+    )
+    await channel.send(embed=embed)
+
 @bot.event
 async def on_ready():
+    if not getattr(bot, "_rw_views_added", False):
+        bot.add_view(VerifyView())
+        bot.add_view(TicketPanel())
+        bot.add_view(TicketControls())
+        bot._rw_views_added = True
     print(f"Rich Waters is online as {bot.user} ({bot.user.id})")
 
 @bot.tree.command(name="setup", description="Build the Rich Waters server layout and permissions.")
@@ -183,6 +374,7 @@ async def setup(interaction: discord.Interaction):
     # Whitelist
     whitelist_cat = await get_or_create_category(guild, "🔑・𝐆𝐄𝐓 𝐖𝐇𝐈𝐓𝐄𝐋𝐈𝐒𝐓𝐄𝐃", hidden)
     await get_or_create_text(whitelist_cat, "🎟️・𝐑𝐄𝐐𝐔𝐄𝐒𝐓-𝐖𝐋", verified_only)
+    await get_or_create_text(whitelist_cat, "✅・𝐖𝐋-𝐀𝐏𝐏𝐑𝐎𝐕𝐄𝐃", verified_only)
 
     # Community
     community = await get_or_create_category(guild, "💎・𝐑𝐈𝐂𝐇 𝐂𝐎𝐌𝐌𝐔𝐍𝐈𝐓𝐘", hidden)
@@ -339,6 +531,101 @@ async def event(
 
     await channel.send(embed=embed)
     await interaction.response.send_message("✅ Event posted.", ephemeral=True)
+
+
+@bot.tree.command(name="verifysetup", description="Post the Rich Waters verification button.")
+@app_commands.guild_only()
+async def verifysetup(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not is_owner_level(interaction.user):
+        return await interaction.response.send_message("Founder or Co Founder only.", ephemeral=True)
+    channel = interaction.guild.get_channel(VERIFY_CHANNEL_ID)
+    if not channel:
+        return await interaction.response.send_message("❌ Verify channel not found.", ephemeral=True)
+    embed = discord.Embed(
+        title="🔐 RICH WATERS VERIFICATION",
+        description="Click **VERIFY** below to complete Discord verification.\n\nAfter verifying, head to <#1565061831528026243> and use **/wl**."
+    )
+    await channel.send(embed=embed, view=VerifyView())
+    await interaction.response.send_message(f"✅ Verify panel posted in {channel.mention}.", ephemeral=True)
+
+@bot.tree.command(name="ticketsetup", description="Post the Rich Waters ticket panel.")
+@app_commands.guild_only()
+async def ticketsetup(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not is_owner_level(interaction.user):
+        return await interaction.response.send_message("Founder or Co Founder only.", ephemeral=True)
+    channel = interaction.guild.get_channel(OPEN_TICKET_CHANNEL_ID)
+    if not channel:
+        return await interaction.response.send_message("❌ Open-a-Ticket channel not found.", ephemeral=True)
+    embed = discord.Embed(
+        title="🎫 RICH WATERS SUPPORT",
+        description=(
+            "Need assistance? Choose a ticket type below. 💎\n\n"
+            "🎫 **General Support**\n"
+            "💰 **Donations**\n"
+            "💋 **Female Verification**"
+        )
+    )
+    await channel.send(embed=embed, view=TicketPanel())
+    await interaction.response.send_message(f"✅ Ticket panel posted in {channel.mention}.", ephemeral=True)
+
+@bot.tree.command(name="wl", description="Request Rich Waters whitelist access.")
+@app_commands.guild_only()
+async def wl_request(interaction: discord.Interaction):
+    member = interaction.user
+    verified = interaction.guild.get_role(VERIFIED_ROLE_ID)
+    wlrole = interaction.guild.get_role(WL_ROLE_ID)
+    if wlrole and wlrole in member.roles:
+        return await interaction.response.send_message("🔑 You're already whitelisted.", ephemeral=True)
+    if verified and verified not in member.roles:
+        return await interaction.response.send_message("🔐 Complete Discord verification first.", ephemeral=True)
+    channel = await wl_requests_channel(interaction.guild)
+    embed = discord.Embed(
+        title="🔑 NEW WHITELIST REQUEST",
+        description=f"**Member:** {member.mention}\n**User ID:** `{member.id}`\n\nApprove with **/whitelist {member.mention}**"
+    )
+    await channel.send(embed=embed)
+    await interaction.response.send_message(
+        "🔑 **Your Rich Waters whitelist request has been submitted!** Please wait for staff approval.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="whitelist", description="Approve a member for Rich Waters whitelist.")
+@app_commands.describe(user="Member to approve")
+@app_commands.guild_only()
+async def whitelist_user(interaction: discord.Interaction, user: discord.Member):
+    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    role = interaction.guild.get_role(WL_ROLE_ID)
+    if not role:
+        return await interaction.response.send_message("❌ WL role not found.", ephemeral=True)
+    try:
+        if role not in user.roles:
+            await user.add_roles(role, reason=f"WL approved by {interaction.user}")
+    except discord.Forbidden:
+        return await interaction.response.send_message("❌ Move the bot role above the WL role.", ephemeral=True)
+
+    approved = await wl_approved_channel(interaction.guild)
+    embed = discord.Embed(
+        title="🥂✨ WELCOME IN! ✨🥂",
+        description=(
+            f"🌴 Welcome to **RICH WATERS RP**, {user.mention}!\n\n"
+            "✅ Your whitelist has officially been **APPROVED!**\n\n"
+            "🔑 You now have access to the **Rich Waters Community**.\n\n"
+            "💎 **BEFORE MAKING YOUR CHARACTER:**\n"
+            "Be sure to check the **WL ITEMS** so you know what's available before you create your character.\n\n"
+            "🎫 **NEED SUPPORT?**\n"
+            f"Open a ticket in <#{OPEN_TICKET_CHANNEL_ID}> and our staff will assist you.\n\n"
+            "🌴💸🥂 **WELCOME TO THE RICH LIFE.** 🥂💸🌴"
+        )
+    )
+    await approved.send(embed=embed)
+    try:
+        await user.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    await interaction.response.send_message(
+        f"✅ {user.mention} approved. Message posted in {approved.mention}.", ephemeral=True
+    )
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it to your environment variables.")
